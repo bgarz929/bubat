@@ -5,6 +5,8 @@
 #include <string>
 #include <chrono>
 #include <iomanip>
+#include <algorithm>  // Ditambahkan untuk remove_if
+#include <cctype>     // Ditambahkan untuk isspace
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
@@ -56,6 +58,17 @@ __device__ bool is_zero(const unsigned char* a) {
     return true;
 }
 
+// Fungsi untuk menghapus whitespace dari string
+string remove_whitespace(const string& str) {
+    string result;
+    for (char c : str) {
+        if (!isspace(c) && c != '\t' && c != '\n' && c != '\r') {
+            result += c;
+        }
+    }
+    return result;
+}
+
 // Fungsi hash sederhana untuk demo
 __device__ void simple_hash160(const unsigned char* data, int len, unsigned char* output) {
     // Simulasi hash sederhana
@@ -76,7 +89,7 @@ __global__ void bruteforce_kernel(
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     
-    // Inisialisasi RNG - PERBAIKAN: gunakan seed yang berbeda per thread
+    // Inisialisasi RNG
     curandState_t state;
     curand_init(seed + tid, 0, 0, &state);
     
@@ -121,9 +134,6 @@ __global__ void bruteforce_kernel(
                     memcpy(results[found_idx].private_key, private_key, 32);
                     memcpy(results[found_idx].hash160, hash160_result, 20);
                     results[found_idx].found = 1;
-                    
-                    // Debug output
-                    // printf("Thread %d found match at target %d\n", tid, i);
                 }
                 break;
             }
@@ -255,14 +265,13 @@ int main(int argc, char* argv[]) {
     vector<string> addresses;
     string line;
     while (getline(file, line)) {
+        // Hapus whitespace
+        line = remove_whitespace(line);
+        
         // Skip comments and empty lines
         if (line.empty() || line[0] == '#') continue;
         
-        // Remove whitespace
-        line.erase(remove_if(line.begin(), line.end(), ::isspace), line.end());
-        if (!line.empty()) {
-            addresses.push_back(line);
-        }
+        addresses.push_back(line);
     }
     file.close();
     
@@ -352,9 +361,9 @@ int main(int argc, char* argv[]) {
     SearchResult* h_results = new SearchResult[MAX_TARGETS];
     int h_found_count = 0;
     
-    // Konfigurasi kernel - PERBAIKAN: mulai dengan konfigurasi kecil
+    // Konfigurasi kernel
     int threads = THREADS_PER_BLOCK;
-    int blocks = 16;  // Mulai dengan jumlah block kecil
+    int blocks = 8;  // Mulai dengan jumlah block kecil untuk Tesla T4
     
     cout << "\n=== Kernel Configuration ===" << endl;
     cout << "Blocks: " << blocks << endl;
@@ -386,18 +395,7 @@ int main(int argc, char* argv[]) {
             if (cuda_status != cudaSuccess) {
                 cout << "\nCUDA Kernel Error (iteration " << iteration << "): " 
                      << cudaGetErrorString(cuda_status) << endl;
-                
-                // Coba konfigurasi yang lebih kecil
-                if (cuda_status == cudaErrorInvalidValue) {
-                    cout << "Trying smaller configuration..." << endl;
-                    blocks = max(1, blocks / 2);
-                    threads = max(32, threads / 2);
-                    cout << "New config: " << blocks << " blocks, " 
-                         << threads << " threads" << endl;
-                    continue;
-                } else {
-                    break;
-                }
+                break;
             }
             
             cuda_status = cudaDeviceSynchronize();
@@ -490,17 +488,17 @@ int main(int argc, char* argv[]) {
             
             // Tingkatkan blocks secara bertahap jika berhasil
             if (iteration % 10 == 0 && iteration > 0) {
-                int max_blocks = 256; // Batas maksimum untuk Tesla T4
+                int max_blocks = 32; // Batas maksimum untuk Tesla T4
                 if (blocks < max_blocks) {
                     blocks = min(blocks * 2, max_blocks);
                     cout << "\nIncreased blocks to: " << blocks << endl;
                 }
             }
             
-            // Cek waktu (maksimal 10 menit untuk demo)
+            // Cek waktu (maksimal 5 menit untuk demo)
             auto total_elapsed = duration_cast<seconds>(current_time - start_time).count();
-            if (total_elapsed > 600) { // 10 menit
-                cout << "\n\nTime limit reached (10 minutes). Stopping." << endl;
+            if (total_elapsed > 300) { // 5 menit
+                cout << "\n\nTime limit reached (5 minutes). Stopping." << endl;
                 break;
             }
         }
