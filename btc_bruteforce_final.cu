@@ -14,6 +14,7 @@
 #include <openssl/ripemd.h>
 #include <csignal>
 #include <atomic>
+#include <mutex>
 
 using namespace std;
 using namespace chrono;
