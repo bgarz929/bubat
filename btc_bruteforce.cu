@@ -1,4 +1,4 @@
-// btc_bruteforce_simple.cu - Bitcoin Brute Force sederhana
+// btc_bruteforce_fixed.cu - Bitcoin Brute Force CUDA (Fixed)
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -14,13 +14,13 @@
 using namespace std;
 using namespace std::chrono;
 
-// Konfigurasi
+// ==================== KONFIGURASI ====================
 #define PRIVATE_KEY_SIZE 32
 #define COMPRESSED_PUBLIC_KEY_SIZE 33
 #define HASH160_SIZE 20
-#define MAX_TARGETS 1000
+#define MAX_TARGETS 100
 #define THREADS_PER_BLOCK 256
-#define BATCH_SIZE 128
+#define BATCH_SIZE 64
 
 // Struktur hasil
 typedef struct {
@@ -29,7 +29,7 @@ typedef struct {
     int found;
 } SearchResult;
 
-// Konstanta GPU
+// ==================== KONSTANTA GPU ====================
 __constant__ unsigned char d_secp256k1_n[32] = {
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
@@ -40,7 +40,7 @@ __constant__ unsigned char d_secp256k1_n[32] = {
 __constant__ unsigned char d_target_hashes[MAX_TARGETS][HASH160_SIZE];
 __constant__ int d_num_targets;
 
-// Fungsi pembantu di GPU
+// ==================== FUNGSI PEMBANTU GPU ====================
 __device__ int compare_big_int(const unsigned char* a, const unsigned char* b) {
     for (int i = 31; i >= 0; i--) {
         if (a[i] < b[i]) return -1;
@@ -56,19 +56,19 @@ __device__ bool is_zero(const unsigned char* a) {
     return true;
 }
 
-// SHA256 sederhana di GPU (untuk demo)
-__device__ void simple_hash160(const unsigned char* public_key, unsigned char* output) {
-    // Hash sederhana untuk demo
+// Fungsi hash sederhana untuk demo
+__device__ void simple_hash160(const unsigned char* data, int len, unsigned char* output) {
+    // Simulasi hash sederhana
     for (int i = 0; i < 20; i++) {
         output[i] = 0;
-        for (int j = 0; j < 33; j++) {
-            output[i] ^= public_key[j] + (i * j);
+        for (int j = 0; j < len && j < 32; j++) {
+            output[i] ^= data[j] + (i * j * 17);
         }
-        output[i] = (output[i] * 31) % 256;
+        output[i] = (output[i] * 31 + i) % 256;
     }
 }
 
-// Kernel utama
+// ==================== KERNEL UTAMA ====================
 __global__ void bruteforce_kernel(
     SearchResult* results,
     int* found_count,
@@ -76,20 +76,20 @@ __global__ void bruteforce_kernel(
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     
-    // Inisialisasi RNG
+    // Inisialisasi RNG - PERBAIKAN: gunakan seed yang berbeda per thread
     curandState_t state;
-    curand_init(seed, tid, 0, &state);
+    curand_init(seed + tid, 0, 0, &state);
     
     // Buffer untuk perhitungan
     unsigned char private_key[32];
     unsigned char public_key[33];
     unsigned char hash160_result[20];
     
-    // Generate dan test BATCH_SIZE keys
+    // Generate dan test beberapa keys per thread
     for (int batch = 0; batch < BATCH_SIZE; batch++) {
         // Generate random private key
         for (int i = 0; i < 32; i++) {
-            private_key[i] = (unsigned char)curand(&state);
+            private_key[i] = curand(&state) & 0xFF;
         }
         
         // Validasi private key
@@ -97,14 +97,13 @@ __global__ void bruteforce_kernel(
         if (compare_big_int(private_key, d_secp256k1_n) >= 0) continue;
         
         // Buat public key sederhana (format compressed)
-        // Catatan: Ini bukan implementasi sebenarnya, hanya untuk demo
         public_key[0] = (private_key[0] & 1) ? 0x03 : 0x02;
         for (int i = 0; i < 32; i++) {
-            public_key[i + 1] = private_key[i] ^ (i * 13);
+            public_key[i + 1] = private_key[i] ^ (i * 13 + batch);
         }
         
-        // Hitung hash160
-        simple_hash160(public_key, hash160_result);
+        // Hitung hash160 sederhana
+        simple_hash160(public_key, 33, hash160_result);
         
         // Bandingkan dengan targets
         for (int i = 0; i < d_num_targets; i++) {
@@ -122,6 +121,9 @@ __global__ void bruteforce_kernel(
                     memcpy(results[found_idx].private_key, private_key, 32);
                     memcpy(results[found_idx].hash160, hash160_result, 20);
                     results[found_idx].found = 1;
+                    
+                    // Debug output
+                    // printf("Thread %d found match at target %d\n", tid, i);
                 }
                 break;
             }
@@ -129,7 +131,7 @@ __global__ void bruteforce_kernel(
     }
 }
 
-// Fungsi bantu CPU
+// ==================== FUNGSI BANTU CPU ====================
 string hex_encode(const unsigned char* data, int len) {
     const char* hex_chars = "0123456789abcdef";
     string result;
@@ -171,36 +173,28 @@ string base58_encode(const unsigned char* data, int len) {
     return result;
 }
 
-// Generate Bitcoin address dari hash160
 string hash160_to_address(const unsigned char* hash160) {
-    // Version byte (0x00 untuk mainnet)
     unsigned char version_hash160[21];
-    version_hash160[0] = 0x00;
+    version_hash160[0] = 0x00; // Mainnet
     memcpy(version_hash160 + 1, hash160, 20);
     
-    // Double SHA256 untuk checksum
     unsigned char checksum1[32], checksum2[32];
     SHA256(version_hash160, 21, checksum1);
     SHA256(checksum1, 32, checksum2);
     
-    // Buat binary address
     unsigned char address_bin[25];
     memcpy(address_bin, version_hash160, 21);
     memcpy(address_bin + 21, checksum2, 4);
     
-    // Encode ke base58
     return base58_encode(address_bin, 25);
 }
 
-// Generate WIF dari private key
 string private_key_to_wif(const unsigned char* private_key) {
-    // WIF format: 0x80 + private_key + 0x01 + checksum(4 bytes)
     unsigned char wif_bytes[38];
-    wif_bytes[0] = 0x80;
+    wif_bytes[0] = 0x80; // Mainnet
     memcpy(wif_bytes + 1, private_key, 32);
-    wif_bytes[33] = 0x01; // compression flag
+    wif_bytes[33] = 0x01; // Compressed
     
-    // Double SHA256 untuk checksum
     unsigned char checksum1[32], checksum2[32];
     SHA256(wif_bytes, 34, checksum1);
     SHA256(checksum1, 32, checksum2);
@@ -210,10 +204,44 @@ string private_key_to_wif(const unsigned char* private_key) {
     return base58_encode(wif_bytes, 38);
 }
 
-// Fungsi utama
+void print_gpu_info() {
+    int device_count;
+    cudaGetDeviceCount(&device_count);
+    
+    if (device_count == 0) {
+        cout << "Error: No CUDA-capable device found" << endl;
+        return;
+    }
+    
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    
+    cout << "GPU Device: " << prop.name << endl;
+    cout << "Compute Capability: " << prop.major << "." << prop.minor << endl;
+    cout << "Total Global Memory: " << prop.totalGlobalMem / (1024*1024*1024.0) << " GB" << endl;
+    cout << "Shared Memory per Block: " << prop.sharedMemPerBlock / 1024 << " KB" << endl;
+    cout << "Max Threads per Block: " << prop.maxThreadsPerBlock << endl;
+    cout << "MultiProcessors: " << prop.multiProcessorCount << endl;
+    cout << "Warp Size: " << prop.warpSize << endl;
+}
+
+// ==================== FUNGSI UTAMA ====================
 int main(int argc, char* argv[]) {
+    cout << "=== Bitcoin Private Key Brute Force (CUDA) ===" << endl;
+    cout << "==============================================" << endl;
+    
+    // Inisialisasi CUDA
+    cudaError_t cuda_status = cudaSetDevice(0);
+    if (cuda_status != cudaSuccess) {
+        cout << "Error setting CUDA device: " << cudaGetErrorString(cuda_status) << endl;
+        return 1;
+    }
+    
+    print_gpu_info();
+    
     if (argc != 2) {
         cout << "Usage: " << argv[0] << " <address_list.txt>" << endl;
+        cout << "Example: " << argv[0] << " list.txt" << endl;
         return 1;
     }
     
@@ -227,36 +255,38 @@ int main(int argc, char* argv[]) {
     vector<string> addresses;
     string line;
     while (getline(file, line)) {
+        // Skip comments and empty lines
+        if (line.empty() || line[0] == '#') continue;
+        
+        // Remove whitespace
+        line.erase(remove_if(line.begin(), line.end(), ::isspace), line.end());
         if (!line.empty()) {
             addresses.push_back(line);
         }
     }
     file.close();
     
-    cout << "Loaded " << addresses.size() << " addresses" << endl;
+    if (addresses.empty()) {
+        cout << "Error: No addresses found in file" << endl;
+        return 1;
+    }
     
-    // Buat target hashes sederhana untuk demo
+    cout << "\nLoaded " << addresses.size() << " addresses from " << argv[1] << endl;
+    
+    // Buat target hashes sederhana
     vector<vector<unsigned char>> target_hashes;
     for (const string& addr : addresses) {
-        // Untuk demo, buat hash dari string address
         vector<unsigned char> hash(HASH160_SIZE);
+        // Hash sederhana dari address string
         for (int i = 0; i < HASH160_SIZE; i++) {
             hash[i] = 0;
-            for (char c : addr) {
-                hash[i] ^= c + i;
+            for (size_t j = 0; j < addr.size(); j++) {
+                hash[i] ^= addr[j] + (i * j * 13);
             }
-            hash[i] = (hash[i] * 17) % 256;
+            hash[i] = (hash[i] * 31 + i) % 256;
         }
         target_hashes.push_back(hash);
     }
-    
-    // Dapatkan info GPU
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
-    
-    cout << "\nGPU: " << prop.name << endl;
-    cout << "Compute Capability: " << prop.major << "." << prop.minor << endl;
-    cout << "Global Memory: " << prop.totalGlobalMem / (1024*1024*1024.0) << " GB" << endl;
     
     // Setup target hashes di GPU
     unsigned char* flat_hashes = new unsigned char[target_hashes.size() * HASH160_SIZE];
@@ -264,122 +294,218 @@ int main(int argc, char* argv[]) {
         memcpy(flat_hashes + i * HASH160_SIZE, target_hashes[i].data(), HASH160_SIZE);
     }
     
-    cudaMemcpyToSymbol(d_target_hashes, flat_hashes, target_hashes.size() * HASH160_SIZE);
+    cuda_status = cudaMemcpyToSymbol(d_target_hashes, flat_hashes, 
+                                     target_hashes.size() * HASH160_SIZE);
+    if (cuda_status != cudaSuccess) {
+        cout << "Error copying target hashes to GPU: " 
+             << cudaGetErrorString(cuda_status) << endl;
+        delete[] flat_hashes;
+        return 1;
+    }
+    
     int num_targets = target_hashes.size();
-    cudaMemcpyToSymbol(d_num_targets, &num_targets, sizeof(int));
+    cuda_status = cudaMemcpyToSymbol(d_num_targets, &num_targets, sizeof(int));
+    if (cuda_status != cudaSuccess) {
+        cout << "Error copying num_targets to GPU: " 
+             << cudaGetErrorString(cuda_status) << endl;
+        delete[] flat_hashes;
+        return 1;
+    }
     
     delete[] flat_hashes;
     
     // Alokasi memori GPU
-    SearchResult* d_results;
-    int* d_found_count;
+    SearchResult* d_results = nullptr;
+    int* d_found_count = nullptr;
     
-    cudaMalloc(&d_results, MAX_TARGETS * sizeof(SearchResult));
-    cudaMalloc(&d_found_count, sizeof(int));
+    cuda_status = cudaMalloc(&d_results, MAX_TARGETS * sizeof(SearchResult));
+    if (cuda_status != cudaSuccess) {
+        cout << "Error allocating d_results: " << cudaGetErrorString(cuda_status) << endl;
+        return 1;
+    }
     
-    cudaMemset(d_found_count, 0, sizeof(int));
+    cuda_status = cudaMalloc(&d_found_count, sizeof(int));
+    if (cuda_status != cudaSuccess) {
+        cout << "Error allocating d_found_count: " << cudaGetErrorString(cuda_status) << endl;
+        cudaFree(d_results);
+        return 1;
+    }
+    
+    // Reset GPU memory
+    cuda_status = cudaMemset(d_found_count, 0, sizeof(int));
+    if (cuda_status != cudaSuccess) {
+        cout << "Error resetting d_found_count: " << cudaGetErrorString(cuda_status) << endl;
+        cudaFree(d_results);
+        cudaFree(d_found_count);
+        return 1;
+    }
+    
+    cuda_status = cudaMemset(d_results, 0, MAX_TARGETS * sizeof(SearchResult));
+    if (cuda_status != cudaSuccess) {
+        cout << "Error resetting d_results: " << cudaGetErrorString(cuda_status) << endl;
+        cudaFree(d_results);
+        cudaFree(d_found_count);
+        return 1;
+    }
     
     // Alokasi memori CPU untuk hasil
     SearchResult* h_results = new SearchResult[MAX_TARGETS];
     int h_found_count = 0;
     
-    // Konfigurasi kernel
+    // Konfigurasi kernel - PERBAIKAN: mulai dengan konfigurasi kecil
     int threads = THREADS_PER_BLOCK;
-    int blocks = min(prop.multiProcessorCount * 4, 65535);
-    int total_threads = blocks * threads;
+    int blocks = 16;  // Mulai dengan jumlah block kecil
     
-    cout << "\nKernel Configuration:" << endl;
+    cout << "\n=== Kernel Configuration ===" << endl;
     cout << "Blocks: " << blocks << endl;
     cout << "Threads per Block: " << threads << endl;
-    cout << "Total Threads: " << total_threads << endl;
+    cout << "Total Threads: " << blocks * threads << endl;
     cout << "Keys per Thread: " << BATCH_SIZE << endl;
-    cout << "Keys per Iteration: " << (long long)total_threads * BATCH_SIZE << endl;
+    cout << "Keys per Iteration: " << (long long)blocks * threads * BATCH_SIZE << endl;
     
     // Seed random
     unsigned long long seed = duration_cast<milliseconds>(
         system_clock::now().time_since_epoch()).count();
     
-    cout << "\nStarting search..." << endl;
+    cout << "\n=== Starting Search ===" << endl;
     cout << "Press Ctrl+C to stop" << endl;
     cout << "==================================" << endl;
     
     // Variabel statistik
     long long total_tested = 0;
     auto start_time = high_resolution_clock::now();
+    auto last_print_time = start_time;
     
     // Main loop
-    for (int iteration = 0; iteration < 10000; iteration++) {
-        // Jalankan kernel
-        bruteforce_kernel<<<blocks, threads>>>(d_results, d_found_count, seed + iteration);
-        
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            cout << "CUDA Error: " << cudaGetErrorString(err) << endl;
-            break;
-        }
-        
-        cudaDeviceSynchronize();
-        
-        // Copy hasil
-        cudaMemcpy(&h_found_count, d_found_count, sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_results, d_results, MAX_TARGETS * sizeof(SearchResult), cudaMemcpyDeviceToHost);
-        
-        total_tested += (long long)total_threads * BATCH_SIZE;
-        
-        // Print progress setiap 5 detik
-        auto current_time = high_resolution_clock::now();
-        auto elapsed = duration_cast<milliseconds>(current_time - start_time).count() / 1000.0;
-        
-        if (iteration % 10 == 0) {
-            double keys_per_sec = total_tested / elapsed;
-            cout << fixed << setprecision(2);
-            cout << "\r[Progress] Keys: " << total_tested 
-                 << " | Speed: " << keys_per_sec / 1000000 << " Mkeys/sec"
-                 << " | Found: " << h_found_count << "      " << flush;
-        }
-        
-        // Jika ditemukan match
-        if (h_found_count > 0) {
-            cout << "\n\n=== FOUND " << h_found_count << " MATCHES ===" << endl;
+    try {
+        for (int iteration = 0; iteration < 1000; iteration++) {
+            // Jalankan kernel dengan error checking
+            bruteforce_kernel<<<blocks, threads>>>(d_results, d_found_count, seed + iteration);
             
-            // Simpan ke file
-            ofstream outfile("found_keys.txt", ios::app);
-            
-            for (int i = 0; i < h_found_count; i++) {
-                cout << "\n--- Match " << (i + 1) << " ---" << endl;
+            cuda_status = cudaGetLastError();
+            if (cuda_status != cudaSuccess) {
+                cout << "\nCUDA Kernel Error (iteration " << iteration << "): " 
+                     << cudaGetErrorString(cuda_status) << endl;
                 
-                // Private key hex
-                string private_key_hex = hex_encode(h_results[i].private_key, 32);
-                cout << "Private Key: " << private_key_hex << endl;
-                
-                // Generate address
-                string address = hash160_to_address(h_results[i].hash160);
-                cout << "Bitcoin Address: " << address << endl;
-                
-                // WIF format
-                string wif = private_key_to_wif(h_results[i].private_key);
-                cout << "WIF: " << wif << endl;
-                
-                // Simpan ke file
-                outfile << "Private Key: " << private_key_hex << endl;
-                outfile << "Address: " << address << endl;
-                outfile << "WIF: " << wif << endl;
-                outfile << "-------------------" << endl;
+                // Coba konfigurasi yang lebih kecil
+                if (cuda_status == cudaErrorInvalidValue) {
+                    cout << "Trying smaller configuration..." << endl;
+                    blocks = max(1, blocks / 2);
+                    threads = max(32, threads / 2);
+                    cout << "New config: " << blocks << " blocks, " 
+                         << threads << " threads" << endl;
+                    continue;
+                } else {
+                    break;
+                }
             }
             
-            outfile.close();
-            cout << "\nResults saved to found_keys.txt" << endl;
+            cuda_status = cudaDeviceSynchronize();
+            if (cuda_status != cudaSuccess) {
+                cout << "\nCUDA Sync Error: " << cudaGetErrorString(cuda_status) << endl;
+                break;
+            }
             
-            // Reset counter
-            h_found_count = 0;
-            cudaMemset(d_found_count, 0, sizeof(int));
+            // Copy hasil dari GPU
+            cuda_status = cudaMemcpy(&h_found_count, d_found_count, sizeof(int), 
+                                    cudaMemcpyDeviceToHost);
+            if (cuda_status != cudaSuccess) {
+                cout << "\nError copying found_count: " 
+                     << cudaGetErrorString(cuda_status) << endl;
+                break;
+            }
+            
+            if (h_found_count > 0) {
+                cuda_status = cudaMemcpy(h_results, d_results, 
+                                        MAX_TARGETS * sizeof(SearchResult), 
+                                        cudaMemcpyDeviceToHost);
+                if (cuda_status != cudaSuccess) {
+                    cout << "\nError copying results: " 
+                         << cudaGetErrorString(cuda_status) << endl;
+                    break;
+                }
+            }
+            
+            total_tested += (long long)blocks * threads * BATCH_SIZE;
+            
+            // Print progress
+            auto current_time = high_resolution_clock::now();
+            auto elapsed = duration_cast<milliseconds>(current_time - last_print_time).count() / 1000.0;
+            
+            if (elapsed >= 2.0) {
+                auto total_elapsed = duration_cast<milliseconds>(current_time - start_time).count() / 1000.0;
+                if (total_elapsed > 0) {
+                    double keys_per_sec = total_tested / total_elapsed;
+                    cout << fixed << setprecision(2);
+                    cout << "\r[Progress] Keys: " << total_tested 
+                         << " | Speed: " << keys_per_sec / 1000000 << " Mkeys/sec"
+                         << " | Found: " << h_found_count << "      " << flush;
+                }
+                last_print_time = current_time;
+            }
+            
+            // Jika ditemukan match
+            if (h_found_count > 0) {
+                cout << "\n\n=== FOUND " << h_found_count << " MATCHES ===" << endl;
+                
+                // Simpan ke file
+                ofstream outfile("found_keys.txt", ios::app);
+                if (!outfile.is_open()) {
+                    cout << "Warning: Cannot open found_keys.txt for writing" << endl;
+                } else {
+                    for (int i = 0; i < h_found_count; i++) {
+                        cout << "\n--- Match " << (i + 1) << " ---" << endl;
+                        
+                        // Private key hex
+                        string private_key_hex = hex_encode(h_results[i].private_key, 32);
+                        cout << "Private Key: " << private_key_hex << endl;
+                        
+                        // Generate address
+                        string address = hash160_to_address(h_results[i].hash160);
+                        cout << "Bitcoin Address: " << address << endl;
+                        
+                        // WIF format
+                        string wif = private_key_to_wif(h_results[i].private_key);
+                        cout << "WIF: " << wif << endl;
+                        
+                        // Simpan ke file
+                        outfile << "Private Key: " << private_key_hex << endl;
+                        outfile << "Address: " << address << endl;
+                        outfile << "WIF: " << wif << endl;
+                        outfile << "-------------------" << endl;
+                    }
+                    outfile.close();
+                    cout << "\nResults saved to found_keys.txt" << endl;
+                }
+                
+                // Reset counter
+                h_found_count = 0;
+                cuda_status = cudaMemset(d_found_count, 0, sizeof(int));
+                if (cuda_status != cudaSuccess) {
+                    cout << "Error resetting d_found_count: " 
+                         << cudaGetErrorString(cuda_status) << endl;
+                    break;
+                }
+            }
+            
+            // Tingkatkan blocks secara bertahap jika berhasil
+            if (iteration % 10 == 0 && iteration > 0) {
+                int max_blocks = 256; // Batas maksimum untuk Tesla T4
+                if (blocks < max_blocks) {
+                    blocks = min(blocks * 2, max_blocks);
+                    cout << "\nIncreased blocks to: " << blocks << endl;
+                }
+            }
+            
+            // Cek waktu (maksimal 10 menit untuk demo)
+            auto total_elapsed = duration_cast<seconds>(current_time - start_time).count();
+            if (total_elapsed > 600) { // 10 menit
+                cout << "\n\nTime limit reached (10 minutes). Stopping." << endl;
+                break;
+            }
         }
-        
-        // Cek waktu (maksimal 5 menit untuk demo)
-        if (elapsed > 300) {
-            cout << "\n\nTime limit reached (5 minutes). Stopping." << endl;
-            break;
-        }
+    } catch (const exception& e) {
+        cout << "\nException: " << e.what() << endl;
     }
     
     // Statistik akhir
@@ -390,15 +516,20 @@ int main(int argc, char* argv[]) {
     cout << "Total keys tested: " << total_tested << endl;
     cout << "Total time: " << total_elapsed << " seconds" << endl;
     if (total_elapsed > 0) {
-        cout << "Average speed: " << (total_tested / total_elapsed) / 1000000 << " Mkeys/second" << endl;
+        cout << "Average speed: " << (total_tested / total_elapsed) / 1000000 
+             << " Mkeys/second" << endl;
     }
-    cout << "GPU: " << prop.name << endl;
+    cout << "Final configuration: " << blocks << " blocks, " 
+         << threads << " threads/block" << endl;
     
     // Cleanup
     delete[] h_results;
     cudaFree(d_results);
     cudaFree(d_found_count);
     
-    cout << "\nProgram finished." << endl;
+    // Reset device
+    cudaDeviceReset();
+    
+    cout << "\nProgram finished successfully." << endl;
     return 0;
 }
