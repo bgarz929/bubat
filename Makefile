@@ -14,37 +14,38 @@ OPENSSL_INC = /usr/include/openssl
 OPENSSL_LIB = /usr/lib/x86_64-linux-gnu
 
 # Compiler flags
-NVCC_FLAGS = -O3 -arch=sm_70 --use_fast_math --ptxas-options=-v --maxrregcount=64 -Xcompiler -fopenmp
-CC_FLAGS = -O3 -march=native -fopenmp
+# HAPUS -Xcompiler -fopenmp dari NVCC_FLAGS, pindah ke LDFLAGS
+NVCC_FLAGS = -O3 -arch=sm_70 --use_fast_math --ptxas-options=-v --maxrregcount=64
+CC_FLAGS = -O3 -march=native
 
 # Linker flags
-LDFLAGS = -L$(CUDA_LIB) -L$(OPENSSL_LIB) -lcudart -lcuda -lcurand -lssl -lcrypto -lpthread -fopenmp
+# Hanya -fopenmp di LDFLAGS untuk g++
+LDFLAGS = -L$(CUDA_LIB) -L$(OPENSSL_LIB) -lcudart -lcuda -lcurand -lssl -lcrypto -lpthread
 
 # Target
 TARGET = btc_bruteforce
 
-# Source files (semua dalam satu file .cu untuk memudahkan)
+# Source files
 SRC = btc_bruteforce.cu
-EXEC = btc_bruteforce
 
 # Default target
-all: $(EXEC)
+all: $(TARGET)
 
 # Compile semua dalam satu langkah
-$(EXEC): $(SRC)
+$(TARGET): $(SRC)
 	$(NVCC) $(NVCC_FLAGS) -I$(CUDA_INC) -I$(OPENSSL_INC) -o $@ $< $(LDFLAGS)
 
 # Clean
 clean:
-	rm -f $(EXEC) *.o found_keys.txt
+	rm -f $(TARGET) *.o found_keys.txt
 
 # Run with address list
-run: $(EXEC)
-	./$(EXEC) list.txt
+run: $(TARGET)
+	./$(TARGET) list.txt
 
 # Performance test
-profile: $(EXEC)
-	nvprof ./$(EXEC) list.txt
+profile: $(TARGET)
+	nvprof ./$(TARGET) list.txt
 
 # Install dependencies (Ubuntu/Debian)
 install-deps:
