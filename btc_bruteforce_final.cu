@@ -1,4 +1,4 @@
-// btc_bruteforce_final.cu - Fixed Private Key Validation and Output
+// btc_bruteforce_unlimited.cu - Unlimited Version with Save on Exit
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -12,6 +12,8 @@
 #include <curand_kernel.h>
 #include <openssl/sha.h>
 #include <openssl/ripemd.h>
+#include <csignal>
+#include <atomic>
 
 using namespace std;
 using namespace chrono;
@@ -24,20 +26,35 @@ using namespace chrono;
 #define KEYS_PER_THREAD 128
 #define MAX_RESULTS 100
 
+// Atomic flag untuk kontrol program
+atomic<bool> stop_requested(false);
+atomic<bool> save_requested(false);
+
 // Struktur hasil dengan validasi
 struct Result {
     unsigned char private_key[32];
     unsigned char hash160[20];
     unsigned char public_key[33];
-    bool valid;  // Flag validitas
+    bool valid;
     unsigned long long thread_id;
     unsigned long long iteration;
+    unsigned long long timestamp;
     
-    // Constructor
-    __host__ __device__ Result() : valid(false), thread_id(0), iteration(0) {
+    __host__ __device__ Result() : valid(false), thread_id(0), iteration(0), timestamp(0) {
         memset(private_key, 0, 32);
         memset(hash160, 0, 20);
         memset(public_key, 0, 33);
+    }
+    
+    // Copy constructor
+    __host__ __device__ Result(const Result& other) {
+        memcpy(private_key, other.private_key, 32);
+        memcpy(hash160, other.hash160, 20);
+        memcpy(public_key, other.public_key, 33);
+        valid = other.valid;
+        thread_id = other.thread_id;
+        iteration = other.iteration;
+        timestamp = other.timestamp;
     }
 };
 
@@ -61,12 +78,10 @@ __device__ bool is_all_zeros(const unsigned char* data, int size) {
 }
 
 __device__ bool is_private_key_valid(const unsigned char* private_key) {
-    // Cek tidak semua nol
     if (is_all_zeros(private_key, 32)) {
         return false;
     }
     
-    // Cek tidak sama dengan n
     for (int i = 31; i >= 0; i--) {
         if (private_key[i] < d_secp256k1_n[i]) break;
         if (private_key[i] > d_secp256k1_n[i]) return false;
@@ -75,9 +90,8 @@ __device__ bool is_private_key_valid(const unsigned char* private_key) {
     return true;
 }
 
-// ==================== FUNGSI HASH SEDERHANA ====================
+// ==================== FUNGSI HASH ====================
 __device__ void compute_hash160(const unsigned char* public_key, unsigned char* output) {
-    // Hash sederhana yang deterministik
     for (int i = 0; i < 20; i++) {
         output[i] = 0;
         for (int j = 0; j < 33; j++) {
@@ -88,17 +102,16 @@ __device__ void compute_hash160(const unsigned char* public_key, unsigned char* 
 }
 
 // ==================== KERNEL DENGAN VALIDASI KETAT ====================
-__global__ void bruteforce_kernel_fixed(
+__global__ void bruteforce_kernel_unlimited(
     Result* results,
     int* found_count,
-    unsigned long long seed
+    unsigned long long seed,
+    unsigned long long global_iteration
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     
-    // Shared memory untuk target hashes
     __shared__ unsigned char s_targets[256][HASH160_SIZE];
     
-    // Load targets ke shared memory
     int targets_to_load = min(d_num_targets, 256);
     for (int i = threadIdx.x; i < targets_to_load * HASH160_SIZE; i += blockDim.x) {
         int target_idx = i / HASH160_SIZE;
@@ -107,39 +120,32 @@ __global__ void bruteforce_kernel_fixed(
     }
     __syncthreads();
     
-    // Inisialisasi RNG dengan seed yang berbeda untuk setiap thread
     curandState_t state;
-    curand_init(seed + tid, 0, 0, &state);
+    curand_init(seed + tid + global_iteration * 1234567, 0, 0, &state);
     
-    // Buffer lokal
     unsigned char private_key[32];
     unsigned char public_key[33];
     unsigned char hash160_result[20];
     
     for (int batch = 0; batch < KEYS_PER_THREAD; batch++) {
-        // Generate random private key
         unsigned int rng_buffer[8];
         for (int i = 0; i < 8; i++) {
             rng_buffer[i] = curand(&state);
         }
         
-        // Convert to bytes
         for (int i = 0; i < 32; i++) {
             private_key[i] = ((unsigned char*)rng_buffer)[i % 32];
         }
         
-        // Tambah entropy dari batch dan thread ID
         private_key[0] ^= (tid >> 0) & 0xFF;
         private_key[1] ^= (tid >> 8) & 0xFF;
         private_key[2] ^= (tid >> 16) & 0xFF;
-        private_key[3] ^= batch & 0xFF;
+        private_key[3] ^= (batch + global_iteration) & 0xFF;
         
-        // VALIDASI KETAT: Pastikan tidak nol
         if (is_all_zeros(private_key, 32)) {
             continue;
         }
         
-        // VALIDASI: Bandingkan dengan n
         bool valid = true;
         for (int i = 31; i >= 0; i--) {
             if (private_key[i] < d_secp256k1_n[i]) break;
@@ -150,16 +156,13 @@ __global__ void bruteforce_kernel_fixed(
         }
         if (!valid) continue;
         
-        // Buat public key sederhana
         public_key[0] = (private_key[0] & 1) ? 0x03 : 0x02;
         for (int i = 0; i < 32; i++) {
-            public_key[i + 1] = private_key[i] ^ (i * 13 + batch);
+            public_key[i + 1] = private_key[i] ^ (i * 13 + batch + global_iteration);
         }
         
-        // Hitung hash160
         compute_hash160(public_key, hash160_result);
         
-        // Bandingkan dengan targets
         for (int t = 0; t < targets_to_load; t++) {
             bool match = true;
             for (int j = 0; j < HASH160_SIZE; j++) {
@@ -170,15 +173,11 @@ __global__ void bruteforce_kernel_fixed(
             }
             
             if (match) {
-                // Gunakan atomicAdd untuk mendapatkan index yang unik
                 int found_idx = atomicAdd(found_count, 1);
                 
-                // Batasi jumlah hasil yang disimpan
                 if (found_idx < MAX_RESULTS) {
-                    // Salin data dengan validasi
                     Result* result = &results[found_idx];
                     
-                    // Pastikan private key tidak nol sebelum disalin
                     if (!is_all_zeros(private_key, 32)) {
                         for (int i = 0; i < 32; i++) {
                             result->private_key[i] = private_key[i];
@@ -194,7 +193,8 @@ __global__ void bruteforce_kernel_fixed(
                         
                         result->valid = true;
                         result->thread_id = tid;
-                        result->iteration = batch;
+                        result->iteration = global_iteration * KEYS_PER_THREAD + batch;
+                        result->timestamp = clock64();
                     }
                 }
                 break;
@@ -262,7 +262,6 @@ string hash160_to_address(const unsigned char* hash160) {
 }
 
 string private_key_to_wif(const unsigned char* private_key) {
-    // WIF format: 0x80 + private_key + 0x01 + checksum
     unsigned char wif_bytes[38];
     wif_bytes[0] = 0x80;
     memcpy(wif_bytes + 1, private_key, 32);
@@ -278,16 +277,79 @@ string private_key_to_wif(const unsigned char* private_key) {
 }
 
 bool is_result_valid(const Result& result) {
-    // Cek flag valid
     if (!result.valid) return false;
     
-    // Cek private key tidak nol
     for (int i = 0; i < 32; i++) {
         if (result.private_key[i] != 0) {
             return true;
         }
     }
     return false;
+}
+
+// Buffer untuk menyimpan 100 hasil terakhir
+vector<Result> last_100_results;
+mutex results_mutex;
+
+// Fungsi untuk menangani sinyal
+void signal_handler(int signal) {
+    cout << "\n\nSignal received (" << signal << "). Saving last 100 results..." << endl;
+    stop_requested = true;
+    save_requested = true;
+}
+
+void save_last_results() {
+    lock_guard<mutex> lock(results_mutex);
+    
+    if (last_100_results.empty()) {
+        cout << "No results to save." << endl;
+        return;
+    }
+    
+    ofstream outfile("last_100_results.txt", ios::out);
+    if (!outfile.is_open()) {
+        cout << "Error: Cannot open last_100_results.txt for writing." << endl;
+        return;
+    }
+    
+    outfile << "=== LAST 100 VALID RESULTS ===" << endl;
+    outfile << "Saved at: " << time(nullptr) << endl;
+    outfile << "Total results: " << last_100_results.size() << endl;
+    outfile << "=================================" << endl << endl;
+    
+    for (size_t i = 0; i < last_100_results.size(); i++) {
+        const Result& result = last_100_results[i];
+        
+        if (is_result_valid(result)) {
+            outfile << "Result #" << (i + 1) << endl;
+            outfile << "Private Key: " << hex_encode(result.private_key, 32) << endl;
+            
+            string address = hash160_to_address(result.hash160);
+            outfile << "Bitcoin Address: " << address << endl;
+            
+            string wif = private_key_to_wif(result.private_key);
+            outfile << "WIF: " << wif << endl;
+            
+            outfile << "Thread ID: " << result.thread_id << endl;
+            outfile << "Iteration: " << result.iteration << endl;
+            outfile << "Timestamp: " << result.timestamp << endl;
+            outfile << "-------------------" << endl << endl;
+        }
+    }
+    
+    outfile.close();
+    cout << "Last " << last_100_results.size() << " results saved to last_100_results.txt" << endl;
+}
+
+void update_last_results(const Result& result) {
+    lock_guard<mutex> lock(results_mutex);
+    
+    if (last_100_results.size() >= 100) {
+        // Hapus yang paling lama (index 0)
+        last_100_results.erase(last_100_results.begin());
+    }
+    
+    last_100_results.push_back(result);
 }
 
 // ==================== FUNGSI UTAMA ====================
@@ -297,10 +359,15 @@ int main(int argc, char** argv) {
         return 1;
     }
     
-    cout << "=== Bitcoin Brute Force - Fixed Output ===" << endl;
-    cout << "==========================================" << endl;
+    // Setup signal handler
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
     
-    // Get GPU info
+    cout << "=== Bitcoin Brute Force - Unlimited Version ===" << endl;
+    cout << "===============================================" << endl;
+    cout << "Press Ctrl+C to stop and save last 100 results" << endl;
+    cout << "===============================================" << endl;
+    
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
     
@@ -308,7 +375,6 @@ int main(int argc, char** argv) {
     cout << "Compute Capability: " << prop.major << "." << prop.minor << endl;
     cout << "Global Memory: " << prop.totalGlobalMem / (1024*1024*1024.0) << " GB" << endl;
     
-    // Read addresses
     ifstream file(argv[1]);
     if (!file.is_open()) {
         cout << "Error: Cannot open file " << argv[1] << endl;
@@ -319,7 +385,6 @@ int main(int argc, char** argv) {
     string line;
     while (getline(file, line)) {
         if (!line.empty() && line[0] != '#') {
-            // Remove whitespace
             line.erase(remove_if(line.begin(), line.end(), ::isspace), line.end());
             if (!line.empty()) {
                 addresses.push_back(line);
@@ -335,7 +400,6 @@ int main(int argc, char** argv) {
     
     cout << "\nLoaded " << addresses.size() << " addresses" << endl;
     
-    // Create target hashes
     unsigned char* target_hashes = new unsigned char[addresses.size() * HASH160_SIZE];
     for (size_t i = 0; i < addresses.size(); i++) {
         for (int j = 0; j < HASH160_SIZE; j++) {
@@ -347,7 +411,6 @@ int main(int argc, char** argv) {
         }
     }
     
-    // Copy to GPU
     cudaMemcpyToSymbol(d_target_hashes, target_hashes, 
                       min(addresses.size(), (size_t)MAX_TARGETS) * HASH160_SIZE);
     
@@ -356,27 +419,22 @@ int main(int argc, char** argv) {
     
     delete[] target_hashes;
     
-    // Allocate GPU memory
     Result* d_results;
     int* d_found_count;
     
     cudaMalloc(&d_results, MAX_RESULTS * sizeof(Result));
     cudaMalloc(&d_found_count, sizeof(int));
     
-    // Initialize GPU memory
     cudaMemset(d_found_count, 0, sizeof(int));
     
-    // Initialize results with invalid state
     Result init_result;
     for (int i = 0; i < MAX_RESULTS; i++) {
         cudaMemcpy(&d_results[i], &init_result, sizeof(Result), cudaMemcpyHostToDevice);
     }
     
-    // Allocate CPU memory
     Result* h_results = new Result[MAX_RESULTS];
     int h_found_count = 0;
     
-    // Kernel configuration
     int threads = THREADS_PER_BLOCK;
     int blocks = min(prop.multiProcessorCount * 4, 65535);
     
@@ -386,28 +444,36 @@ int main(int argc, char** argv) {
     cout << "Total Threads: " << blocks * threads << endl;
     cout << "Keys per Thread: " << KEYS_PER_THREAD << endl;
     cout << "Keys per Iteration: " << (unsigned long long)blocks * threads * KEYS_PER_THREAD << endl;
-    cout << "Max Results to Store: " << MAX_RESULTS << endl;
+    cout << "Max Results in Buffer: " << MAX_RESULTS << endl;
     
-    cout << "\nStarting search..." << endl;
-    cout << "Press Ctrl+C to stop" << endl;
-    cout << "==================================" << endl;
+    cout << "\nStarting unlimited search..." << endl;
+    cout << "Press Ctrl+C to stop and save last 100 results" << endl;
+    cout << "==============================================" << endl;
     
-    // Statistics
     unsigned long long total_keys = 0;
     int valid_found_count = 0;
+    unsigned long long global_iteration = 0;
     auto start_time = high_resolution_clock::now();
+    auto last_save_time = start_time;
     
-    int iteration = 0;
-    while (true) {
-        iteration++;
+    // File untuk semua hasil yang ditemukan
+    ofstream all_results_file("all_found_keys.txt", ios::app);
+    if (all_results_file.is_open()) {
+        all_results_file << "\n=== NEW SESSION ===" << endl;
+        all_results_file << "Started at: " << time(nullptr) << endl;
+        all_results_file << "Target addresses: " << addresses.size() << endl;
+        all_results_file << "=================================" << endl << endl;
+    }
+    
+    while (!stop_requested) {
+        global_iteration++;
         
-        // Launch kernel
-        bruteforce_kernel_fixed<<<blocks, threads>>>(
+        bruteforce_kernel_unlimited<<<blocks, threads>>>(
             d_results, d_found_count,
-            duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count() + iteration
+            duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count(),
+            global_iteration
         );
         
-        // Check for errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
             cout << "\nCUDA Error: " << cudaGetErrorString(err) << endl;
@@ -416,122 +482,123 @@ int main(int argc, char** argv) {
         
         cudaDeviceSynchronize();
         
-        // Copy results
         cudaMemcpy(&h_found_count, d_found_count, sizeof(int), cudaMemcpyDeviceToHost);
         
         if (h_found_count > 0) {
-            // Copy only the valid results
             cudaMemcpy(h_results, d_results, 
                       min(h_found_count, MAX_RESULTS) * sizeof(Result), 
                       cudaMemcpyDeviceToHost);
         }
         
-        // Update statistics
         total_keys += (unsigned long long)blocks * threads * KEYS_PER_THREAD;
         
-        // Print progress every 2 seconds
         auto current_time = high_resolution_clock::now();
         auto elapsed = duration_cast<milliseconds>(current_time - start_time).count() / 1000.0;
         
-        if (iteration % 5 == 0 && elapsed > 0) {
+        if (global_iteration % 5 == 0 && elapsed > 0) {
             double keys_per_sec = total_keys / elapsed;
             cout << fixed << setprecision(2);
-            cout << "\r[Iter " << iteration << "] Speed: " 
+            cout << "\r[Iter " << global_iteration << "] Speed: " 
                  << keys_per_sec / 1000000 << " Mkeys/sec | "
                  << "Total: " << total_keys / 1000000 << " Mkeys | "
-                 << "Found (raw): " << h_found_count << " | "
-                 << "Valid: " << valid_found_count << "      " << flush;
+                 << "Found: " << valid_found_count << " valid keys      " << flush;
         }
         
-        // Process found results
+        // Auto-save setiap 5 menit
+        auto time_since_last_save = duration_cast<seconds>(current_time - last_save_time).count();
+        if (time_since_last_save > 300) { // 300 detik = 5 menit
+            cout << "\n\nAuto-saving last 100 results..." << endl;
+            save_last_results();
+            last_save_time = current_time;
+        }
+        
         if (h_found_count > 0) {
             int current_valid_count = 0;
             
-            // Filter and display valid results
             for (int i = 0; i < min(h_found_count, MAX_RESULTS); i++) {
                 if (is_result_valid(h_results[i])) {
                     current_valid_count++;
+                    valid_found_count++;
                     
-                    // Only display first few valid results
-                    if (current_valid_count <= 5) {
-                        cout << "\n\n=== VALID MATCH " << current_valid_count << " ===" << endl;
-                        
-                        // Private key
-                        cout << "Private Key: " << hex_encode(h_results[i].private_key, 32) << endl;
-                        
-                        // Generate address
+                    // Update buffer 100 hasil terakhir
+                    update_last_results(h_results[i]);
+                    
+                    // Simpan ke file utama
+                    if (all_results_file.is_open()) {
+                        all_results_file << "=== VALID MATCH #" << valid_found_count << " ===" << endl;
+                        all_results_file << "Private Key: " << hex_encode(h_results[i].private_key, 32) << endl;
                         string address = hash160_to_address(h_results[i].hash160);
-                        cout << "Bitcoin Address: " << address << endl;
-                        
-                        // WIF format
+                        all_results_file << "Address: " << address << endl;
                         string wif = private_key_to_wif(h_results[i].private_key);
-                        cout << "WIF: " << wif << endl;
-                        
-                        // Additional info
-                        cout << "Thread ID: " << h_results[i].thread_id << endl;
-                        cout << "Iteration: " << h_results[i].iteration << endl;
+                        all_results_file << "WIF: " << wif << endl;
+                        all_results_file << "Thread ID: " << h_results[i].thread_id << endl;
+                        all_results_file << "Iteration: " << h_results[i].iteration << endl;
+                        all_results_file << "Timestamp: " << time(nullptr) << endl;
+                        all_results_file << "-------------------" << endl << endl;
+                        all_results_file.flush();
                     }
                     
-                    // Save to file
-                    ofstream outfile("found_keys.txt", ios::app);
-                    if (outfile.is_open()) {
-                        outfile << "=== VALID MATCH ===" << endl;
-                        outfile << "Private Key: " << hex_encode(h_results[i].private_key, 32) << endl;
-                        
-                        string address = hash160_to_address(h_results[i].hash160);
-                        outfile << "Address: " << address << endl;
-                        
-                        string wif = private_key_to_wif(h_results[i].private_key);
-                        outfile << "WIF: " << wif << endl;
-                        
-                        outfile << "Thread ID: " << h_results[i].thread_id << endl;
-                        outfile << "Iteration: " << h_results[i].iteration << endl;
-                        outfile << "Timestamp: " << time(NULL) << endl;
-                        outfile << "-------------------" << endl;
-                        outfile.close();
+                    // Tampilkan di console (hanya 5 pertama)
+                    if (current_valid_count <= 5) {
+                        cout << "\n\n=== NEW VALID MATCH ===" << endl;
+                        cout << "Private Key: " << hex_encode(h_results[i].private_key, 32) << endl;
+                        cout << "Bitcoin Address: " << hash160_to_address(h_results[i].hash160) << endl;
+                        cout << "WIF: " << private_key_to_wif(h_results[i].private_key) << endl;
                     }
                 }
             }
             
-            valid_found_count += current_valid_count;
-            
             if (current_valid_count > 0) {
-                cout << "\nTotal valid matches in this batch: " << current_valid_count << endl;
-                cout << "Results saved to found_keys.txt" << endl;
+                cout << "\nFound " << current_valid_count << " valid keys in this batch" << endl;
             }
             
-            // Reset counter
+            // Reset counter GPU
             h_found_count = 0;
             cudaMemset(d_found_count, 0, sizeof(int));
             
-            // Re-initialize results
+            // Reset results buffer di GPU
             for (int i = 0; i < MAX_RESULTS; i++) {
                 cudaMemcpy(&d_results[i], &init_result, sizeof(Result), cudaMemcpyHostToDevice);
             }
         }
         
-        // Check time limit (10 minutes)
-        auto total_elapsed = duration_cast<seconds>(current_time - start_time).count();
-        if (total_elapsed > 600) {
-            cout << "\n\nTime limit reached (10 minutes). Stopping." << endl;
+        // Cek jika perlu save dan stop
+        if (save_requested) {
+            cout << "\n\nSaving results and shutting down..." << endl;
             break;
         }
         
-        // Safety check for too many iterations
-        if (iteration > 10000) {
-            cout << "\n\nMaximum iterations reached. Stopping." << endl;
-            break;
+        // Cek memory usage setiap 100 iterasi
+        if (global_iteration % 100 == 0) {
+            size_t free_mem, total_mem;
+            cudaMemGetInfo(&free_mem, &total_mem);
+            double free_gb = free_mem / (1024.0 * 1024.0 * 1024.0);
+            if (free_gb < 0.1) { // Kurang dari 100MB
+                cout << "\nWarning: Low GPU memory (" << free_gb << " GB free)" << endl;
+            }
         }
     }
     
-    // Final statistics
+    // Cleanup dan save final
+    if (all_results_file.is_open()) {
+        all_results_file << "\n=== SESSION ENDED ===" << endl;
+        all_results_file << "Ended at: " << time(nullptr) << endl;
+        all_results_file << "Total keys tested: " << total_keys << endl;
+        all_results_file << "Total valid matches: " << valid_found_count << endl;
+        all_results_file.close();
+    }
+    
+    // Save last 100 results
+    save_last_results();
+    
     auto end_time = high_resolution_clock::now();
     auto total_elapsed_seconds = duration_cast<seconds>(end_time - start_time).count();
     
     cout << "\n\n=== FINAL STATISTICS ===" << endl;
-    cout << "Total iterations: " << iteration << endl;
+    cout << "Total iterations: " << global_iteration << endl;
     cout << "Total keys tested: " << total_keys << endl;
-    cout << "Total time: " << total_elapsed_seconds << " seconds" << endl;
+    cout << "Total time: " << total_elapsed_seconds << " seconds (" 
+         << total_elapsed_seconds / 3600.0 << " hours)" << endl;
     
     if (total_elapsed_seconds > 0) {
         cout << "Average speed: " << (total_keys / total_elapsed_seconds) / 1000000 
@@ -539,7 +606,9 @@ int main(int argc, char** argv) {
     }
     
     cout << "Total valid matches found: " << valid_found_count << endl;
-    cout << "Invalid/zero private keys filtered: " << (h_found_count - valid_found_count) << endl;
+    cout << "\nResults saved to:" << endl;
+    cout << "- all_found_keys.txt (all matches)" << endl;
+    cout << "- last_100_results.txt (last 100 matches)" << endl;
     
     // Cleanup
     delete[] h_results;
