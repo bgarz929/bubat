@@ -1,4 +1,4 @@
-# Makefile for Optimized Bitcoin Brute Force
+# Makefile for Optimized Bitcoin Brute Force (Tesla T4)
 CC = nvcc
 CFLAGS = -O3 -arch=sm_75 --use_fast_math --ftz=true --prec-div=false --prec-sqrt=false \
          --fmad=true -Xptxas -O3,-v,-dlcm=cg -maxrregcount=64
@@ -8,23 +8,22 @@ TARGET = btc_bruteforce_opt
 
 # Tesla T4 specific optimizations
 T4_FLAGS = --generate-code arch=compute_75,code=sm_75 \
-           --ptxas-options=-v \
-           --default-stream per-thread
+           --ptxas-options=-v
 
 # Default target
 all: $(TARGET)
 
 # Compile with Tesla T4 optimizations
-$(TARGET): btc_bruteforce_optimized.cu
+$(TARGET): btc_bruteforce_optimized_fixed.cu
 	$(CC) $(CFLAGS) $(T4_FLAGS) -Xcompiler="$(CXXFLAGS)" -o $@ $< $(LDFLAGS)
 
 # Debug build
 debug:
-	$(CC) -G -g -arch=sm_75 -o $(TARGET)_debug btc_bruteforce_optimized.cu $(LDFLAGS)
+	$(CC) -G -g -arch=sm_75 -o $(TARGET)_debug btc_bruteforce_optimized_fixed.cu $(LDFLAGS)
 
 # Profile build
 profile:
-	$(CC) $(CFLAGS) $(T4_FLAGS) --profile-all-functions -Xcompiler="$(CXXFLAGS)" -o $(TARGET)_profile btc_bruteforce_optimized.cu $(LDFLAGS)
+	$(CC) $(CFLAGS) $(T4_FLAGS) --profile-all-functions -Xcompiler="$(CXXFLAGS)" -o $(TARGET)_profile btc_bruteforce_optimized_fixed.cu $(LDFLAGS)
 
 # Clean
 clean:
@@ -38,9 +37,4 @@ run: $(TARGET)
 quick: $(TARGET)
 	./$(TARGET) rich.txt
 
-# Install dependencies
-install-deps:
-	sudo apt-get update
-	sudo apt-get install -y nvidia-cuda-toolkit nvidia-driver-525 libssl-dev build-essential
-
-.PHONY: all debug profile clean run quick install-deps
+.PHONY: all debug profile clean run quick
