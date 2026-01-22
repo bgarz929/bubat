@@ -10,6 +10,7 @@
 #include <atomic>
 #include <thread>
 #include <signal.h>
+#include <ctime>  // Ditambahkan untuk fungsi time dan localtime
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
@@ -65,6 +66,14 @@ __device__ unsigned long long d_sample_counter = 0;
 
 // ==================== FUNGSI VALIDASI ====================
 __device__ bool is_all_zeros(const unsigned char* data, int size) {
+    for (int i = 0; i < size; i++) {
+        if (data[i] != 0) return false;
+    }
+    return true;
+}
+
+// Fungsi host version untuk validasi di CPU
+bool is_all_zeros_host(const unsigned char* data, int size) {
     for (int i = 0; i < size; i++) {
         if (data[i] != 0) return false;
     }
@@ -153,8 +162,8 @@ __global__ void bruteforce_kernel_unlimited(
         }
         
         // Tambah entropy tambahan
-        private_key[0] ^= clock() & 0xFF;
-        private_key[1] ^= (clock() >> 8) & 0xFF;
+        private_key[0] ^= clock64() & 0xFF;
+        private_key[1] ^= (clock64() >> 8) & 0xFF;
         
         // VALIDASI: Pastikan tidak nol
         if (is_all_zeros(private_key, 32)) {
@@ -314,8 +323,10 @@ void display_thread_func(atomic<bool>& stop_flag,
             }
             
             print_colored("═══════════════════════════════════════════════════════════════\n", 33);
-            cout << "\nPress Ctrl+C to stop the search\n";
-            cout << "Current time: " << put_time(localtime(&time(nullptr)), "%H:%M:%S") << "\n";
+            
+            // Perbaikan: Gunakan variabel time_t untuk localtime
+            time_t current_time = time(nullptr);
+            cout << "Current time: " << put_time(localtime(&current_time), "%H:%M:%S") << "\n";
             
             last_display = now;
         }
@@ -535,7 +546,8 @@ int main(int argc, char** argv) {
                 // Process found results
                 int current_valid = 0;
                 for (int i = 0; i < min(h_found_count, MAX_RESULTS); i++) {
-                    if (h_results[i].valid && !is_all_zeros(h_results[i].private_key, 32)) {
+                    // Perbaikan: Gunakan fungsi host version untuk validasi di CPU
+                    if (h_results[i].valid && !is_all_zeros_host(h_results[i].private_key, 32)) {
                         current_valid++;
                         
                         // Save to file
