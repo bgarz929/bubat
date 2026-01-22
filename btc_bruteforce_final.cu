@@ -70,16 +70,16 @@ __constant__ unsigned char d_secp256k1_n[32] = {
 __constant__ unsigned char d_target_hashes[MAX_TARGETS][HASH160_SIZE];
 __constant__ int d_num_targets;
 
-// ==================== FUNGSI VALIDASI ====================
-__device__ bool is_all_zeros(const unsigned char* data, int size) {
+// ==================== FUNGSI VALIDASI GPU ====================
+__device__ bool is_all_zeros_gpu(const unsigned char* data, int size) {
     for (int i = 0; i < size; i++) {
         if (data[i] != 0) return false;
     }
     return true;
 }
 
-__device__ bool is_private_key_valid(const unsigned char* private_key) {
-    if (is_all_zeros(private_key, 32)) {
+__device__ bool is_private_key_valid_gpu(const unsigned char* private_key) {
+    if (is_all_zeros_gpu(private_key, 32)) {
         return false;
     }
     
@@ -91,11 +91,23 @@ __device__ bool is_private_key_valid(const unsigned char* private_key) {
     return true;
 }
 
-// ==================== FUNGSI HASH YANG LEBIH BAIK ====================
+// ==================== FUNGSI VALIDASI CPU ====================
+bool is_all_zeros_cpu(const unsigned char* data, int size) {
+    for (int i = 0; i < size; i++) {
+        if (data[i] != 0) return false;
+    }
+    return true;
+}
+
+// ==================== FUNGSI HASH GPU ====================
 __device__ void compute_simple_hash160(const unsigned char* public_key, unsigned char* output) {
     // Hash yang lebih sederhana namun deterministik
     unsigned char temp[33];
-    memcpy(temp, public_key, 33);
+    
+    // Copy public key ke temp
+    for (int i = 0; i < 33; i++) {
+        temp[i] = public_key[i];
+    }
     
     for (int i = 0; i < 20; i++) {
         output[i] = 0;
@@ -167,7 +179,7 @@ __global__ void bruteforce_kernel_unlimited(
         private_key[5] ^= (global_iteration >> 8) & 0xFF;
         
         // Pastikan private key tidak nol
-        if (is_all_zeros(private_key, 32)) {
+        if (is_all_zeros_gpu(private_key, 32)) {
             private_key[31] = 1;  // Set LSB to 1
         }
         
@@ -310,8 +322,8 @@ string private_key_to_wif(const unsigned char* private_key) {
 bool is_result_valid(const Result& result) {
     if (!result.valid) return false;
     
-    // Cek private key tidak nol
-    if (is_all_zeros(result.private_key, 32)) {
+    // Cek private key tidak nol menggunakan fungsi CPU
+    if (is_all_zeros_cpu(result.private_key, 32)) {
         return false;
     }
     
@@ -499,9 +511,6 @@ int main(int argc, char** argv) {
     // Kernel configuration
     int threads = THREADS_PER_BLOCK;
     int blocks = min(prop.multiProcessorCount * 4, 65535);
-    
-    // Untuk testing, kurangi blocks jika perlu
-    blocks = min(blocks, 512);  // Batasi untuk testing
     
     cout << "\nKernel Configuration:" << endl;
     cout << "Blocks: " << blocks << endl;
