@@ -1,6 +1,8 @@
 /*
  * btc_bruteforce_unlimited.cu
- * UPGRADED VERSION: Menggunakan SECP256K1 Library untuk validasi output.
+ * VERSION: FIXED & UPGRADED
+ * - Fix Compile Error: (char*) cast untuk SetBase16
+ * - Integrasi SECP256K1 untuk validasi WIF & Address
  */
 
 #include <iostream>
@@ -37,10 +39,7 @@
 // ==================== STRUKTUR DATA ====================
 struct ResultPacket {
     uint64_t priv_key[4];  // Private Key (256-bit)
-    // Kita tidak lagi butuh pub_x/pub_y dari GPU untuk final output
-    // karena akan dihitung ulang oleh CPU agar akurat.
-    // Tapi tetap dibiarkan di struct jika kernel memerlukannya.
-    uint64_t pub_x[4];     
+    uint64_t pub_x[4];     // Tidak digunakan untuk final output (re-calc di CPU)
     uint64_t pub_y_parity; 
 };
 
@@ -84,12 +83,10 @@ SafeQueue<std::vector<ResultPacket>> result_queue(MAX_QUEUE_SIZE);
 // ==================== HELPER FUNCTION ====================
 
 // Mengubah array uint64_t dari GPU menjadi Hex String untuk Library SECP
+// Menggunakan loop mundur (3 ke 0) untuk Big Endian format
 std::string uint64_to_hex(const uint64_t* key) {
     std::stringstream ss;
     ss << std::hex << std::setfill('0');
-    // Iterasi dari 3 ke 0 karena BigInt biasanya Big Endian, 
-    // sedangkan GPU struct seringkali diisi little/big tergantung implementasi kernel.
-    // Jika hasil address masih salah, ubah loop ini menjadi (int i=0; i<4; i++)
     for(int i = 3; i >= 0; i--) {
         ss << std::setw(16) << key[i];
     }
@@ -97,37 +94,30 @@ std::string uint64_to_hex(const uint64_t* key) {
 }
 
 // ==================== CUDA KERNEL ====================
-// (Menjaga kernel tetap sederhana untuk kecepatan brute force)
-
+// Kernel placeholder/bruteforce logic
 __global__ void crack_bip32_kernel(uint64_t seed, ResultPacket* output, int* count, int max_out) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     curandState state;
     curand_init(seed, idx, 0, &state);
 
-    // Placeholder Logic:
-    // Di real implementation, ini adalah loop pencarian key / math secp256k1 di GPU.
-    // Untuk demo ini, kita generate random key.
+    // [LOGIKA BRUTEFORCE GPU DI SINI]
+    // Untuk contoh ini, kita generate random key
     
-    // CONTOH SEDERHANA: Generate Random Private Key
     uint64_t pk[4];
     pk[0] = curand(&state);
     pk[1] = curand(&state);
     pk[2] = curand(&state);
     pk[3] = curand(&state);
 
-    // Kriteria pencarian (Misal: prefix tertentu) - Disederhanakan
-    // Anggap kita 'menemukan' sesuatu setiap X iterasi
+    // Simulasi menemukan sesuatu (misal setiap 1 juta iterasi)
+    // Di kode asli Anda, ini harus diganti dengan pengecekan hash/address target
     if (curand(&state) % 1000000 == 0) { 
         int pos = atomicAdd(count, 1);
         if (pos < max_out) {
-            // Copy Private Key ke Output
             output[pos].priv_key[0] = pk[0];
             output[pos].priv_key[1] = pk[1];
             output[pos].priv_key[2] = pk[2];
             output[pos].priv_key[3] = pk[3];
-            
-            // Kita tidak perlu mengisi pub_x di sini karena akan dihitung ulang CPU
-            // untuk menjamin validitas.
         }
     }
 }
@@ -158,7 +148,7 @@ public:
             cudaMemcpy(d_count, h_count, sizeof(int), cudaMemcpyHostToDevice);
 
             // Launch Kernel
-            int blocks = 1024; // Sesuaikan dengan GPU
+            int blocks = 1024; 
             crack_bip32_kernel<<<blocks, THREADS_PER_BLOCK>>>(time(NULL) + device_id, d_output, d_count, max_output_per_batch);
             
             cudaDeviceSynchronize();
@@ -183,7 +173,6 @@ public:
 
 int main() {
     // 1. Inisialisasi Library SECP256K1
-    // Ini langkah krusial agar perhitungan di CPU valid
     printf("[INIT] Initializing SECP256K1 Tables...\n");
     Secp256K1 secp;
     secp.Init();
@@ -201,41 +190,38 @@ int main() {
         while(result_queue.pop(chunk)) {
             for(const auto& res : chunk) {
                 
-                // --- BAGIAN UTAMA PERBAIKAN ---
+                // --- VALIDASI & GENERATE VIA CPU ---
                 
                 // A. Ambil Private Key dari hasil GPU
                 Int privKeyInt;
                 // Konversi uint64[4] ke Hex String
                 std::string privHex = uint64_to_hex(res.priv_key); 
-                privKeyInt.SetBase16(privHex.c_str());
+                
+                // [FIX COMPILE ERROR] Cast ke (char*) agar sesuai dengan parameter SetBase16
+                privKeyInt.SetBase16((char*)privHex.c_str());
 
                 // B. Hitung Ulang Public Key menggunakan Library CPU
-                // Ini memastikan sinkronisasi 100% antara privkey dan pubkey
+                // Memastikan Address yang dihasilkan 100% berasal dari Private Key ini
                 Point pubKey = secp.ComputePublicKey(&privKeyInt);
 
                 // C. Generate WIF (Compressed)
                 std::string wif = secp.GetPrivAddress(true, privKeyInt);
                 
                 // D. Generate Address (Compressed P2PKH)
-                // Type P2PKH = 0, Compressed = true
                 std::string addr = secp.GetAddress(P2PKH, true, pubKey);
                 
-                // E. Simpan / Tampilkan
-                // Format: WIF, Address
+                // E. Simpan ke File
                 fprintf(fp, "%s,%s\n", wif.c_str(), addr.c_str());
-                
-                // Debug Print (Opsional, matikan jika speed turun)
-                // printf("Found: %s -> %s\n", wif.c_str(), addr.c_str());
             }
             
             total_written += chunk.size();
             
             // Statistik Console
-            if (total_written % 10 == 0) { // Update interval
+            if (total_written % 10 == 0) { 
                 auto t_now = std::chrono::high_resolution_clock::now();
                 double elap = std::chrono::duration<double>(t_now - t_start).count();
-                printf("\r[FOUND] Total: %lu keys | Last: %s...   ", 
-                       total_written, chunk.back().priv_key); // Hanya print raw pointer address sekilas
+                printf("\r[FOUND] Total: %lu keys | Speed: %.2f/s   ", 
+                       total_written, total_written/elap); 
                 fflush(stdout);
             }
         }
@@ -255,7 +241,7 @@ int main() {
         worker_threads.push_back(std::thread(&GPUWorker::run, workers[i]));
     }
 
-    // Join threads (Program berjalan selamanya)
+    // Join threads
     writer.join();
     for(auto& t : worker_threads) t.join();
 
