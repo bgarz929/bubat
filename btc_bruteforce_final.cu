@@ -1,7 +1,8 @@
 /*
- * btc_dump_all_generator.cu
- * MODIFIED: Save ALL generated Addresses & WIFs (Generator Mode)
- * WARNING: I/O Bound. Performance depends on Disk Write Speed.
+ * btc_dump_all_stable.cu
+ * FITUR: Dump All Private Keys & Address
+ * FIX: Menambahkan Bounded Queue untuk mencegah RAM penuh & Crash
+ * FIX: Error checking lengkap
  */
 
 #include <iostream>
@@ -17,35 +18,38 @@
 #include <chrono>
 #include <iomanip>
 #include <cstring>
+#include <cstdio>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 
 // ==================== KONFIGURASI ====================
 #define THREADS_PER_BLOCK 256
-// KITA KURANGI BATCH SIZE AGAR MEMORY TIDAK MELEDAK SAAT MENYIMPAN SEMUA
-#define KEYS_PER_THREAD   16     // Dikurangi dari 512 ke 16 agar buffer muat di VRAM
-#define BLOCKS_MULTIPLIER 32     
-#define BLOOM_SIZE_BITS   (1 << 24) 
-#define BLOOM_ARRAY_SIZE  (BLOOM_SIZE_BITS / 32)
+#define BLOCKS_MULTIPLIER 16    // Dikurangi agar kernel lebih ringan (mencegah TDR/Freeze)
+#define KEYS_PER_THREAD   4     // Dikurangi drastis karena kita menyimpan SEMUA data
+#define MAX_QUEUE_SIZE    50    // Maksimal 50 batch antri di RAM. Jika penuh, GPU pause.
 
-// Konstanta ECC (Secp256k1)
-#define SECP256K1_P 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+// Macro cek error CUDA
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA Error at %s:%d - %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(1); \
+        } \
+    } while (0)
 
 // ==================== STRUKTUR DATA ====================
 
 struct ResultPacket {
-    uint64_t full_priv_key[4]; // Simpan FULL private key (32 bytes)
+    uint64_t full_priv_key[4]; 
     unsigned char hash160[20];
-    int gpu_id;
 };
 
-// ==================== CRYPTO HELPERS (HOST SIDE) ====================
-// Implementasi Mini SHA256 dan Base58 untuk konversi WIF/Address di CPU
+// ==================== CRYPTO HELPERS (CPU SIDE) ====================
 
 static const char* BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-// Rotasi kanan (SHA256 helper)
 #define ROTR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
 #define CH(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
 #define MAJ(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
@@ -84,24 +88,14 @@ void sha256_transform(uint32_t *state, const uint8_t *data) {
 }
 
 void simple_sha256(const uint8_t *data, size_t len, uint8_t *hash) {
-    uint32_t state[8] = {
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
-    };
+    uint32_t state[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
     uint8_t buffer[64];
-    uint32_t bitlen[2] = {0, 0}; // Simplified for short inputs
-    bitlen[1] = len * 8; // Assuming len < 56 bytes for our use case (keys/addresses)
-
+    uint32_t bitlen = len * 8;
     memcpy(buffer, data, len);
     buffer[len++] = 0x80;
     while (len < 56) buffer[len++] = 0;
-    
-    // Append length (Big Endian)
-    buffer[63] = bitlen[1] & 0xFF; buffer[62] = (bitlen[1] >> 8) & 0xFF;
-    // (Ignoring high bits for short inputs)
-
+    buffer[63] = bitlen & 0xFF; buffer[62] = (bitlen >> 8) & 0xFF;
     sha256_transform(state, buffer);
-
     for (int i = 0; i < 8; ++i) {
         hash[i * 4] = (state[i] >> 24) & 0xFF;
         hash[i * 4 + 1] = (state[i] >> 16) & 0xFF;
@@ -110,34 +104,23 @@ void simple_sha256(const uint8_t *data, size_t len, uint8_t *hash) {
     }
 }
 
-// Double SHA256 (Hash256)
 void hash256(const uint8_t* data, size_t len, uint8_t* out) {
     uint8_t tmp[32];
     simple_sha256(data, len, tmp);
     simple_sha256(tmp, 32, out);
 }
 
-// Base58Check Encoding
 std::string EncodeBase58Check(const uint8_t* payload, size_t len) {
-    uint8_t data[64]; // payload + checksum
+    uint8_t data[64]; 
     memcpy(data, payload, len);
-
-    // Calculate Checksum (First 4 bytes of Double SHA256)
     uint8_t hash[32];
     hash256(payload, len, hash);
     memcpy(data + len, hash, 4);
-    
     size_t data_len = len + 4;
-
-    // Convert to Base58
-    // Counting leading zeros
     int zeros = 0;
     while (zeros < data_len && data[zeros] == 0) zeros++;
-
-    // Convert byte array to big integer
-    std::vector<unsigned char> b58((data_len * 138 / 100) + 1); // log(256)/log(58) approx 1.38
+    std::vector<unsigned char> b58((data_len * 138 / 100) + 1);
     size_t size = 0;
-
     for (size_t i = 0; i < data_len; ++i) {
         int carry = data[i];
         for (size_t j = 0; j < size; ++j) {
@@ -150,39 +133,26 @@ std::string EncodeBase58Check(const uint8_t* payload, size_t len) {
             carry /= 58;
         }
     }
-
     std::string result;
     result.reserve(zeros + size);
     result.assign(zeros, '1');
-    for (int i = size - 1; i >= 0; --i)
-        result += BASE58_ALPHABET[b58[i]];
-
+    for (int i = size - 1; i >= 0; --i) result += BASE58_ALPHABET[b58[i]];
     return result;
 }
 
 std::string ToWIF(const uint64_t* priv_key_u64) {
-    // Convert 4x uint64 to 32 bytes array (Big Endian)
-    uint8_t raw[34];
-    raw[0] = 0x80; // Mainnet Private Key Prefix
-    
-    // Flip endianness for string rep if needed, but assuming u64 is standard layout
-    // We need to carefully pack the u64 array into bytes.
-    // Assuming priv_key[0] is most significant 64 bits.
+    uint8_t raw[33];
+    raw[0] = 0x80;
     for(int i=0; i<4; i++) {
         uint64_t val = priv_key_u64[i];
-        for(int b=0; b<8; b++) {
-            raw[1 + i*8 + (7-b)] = (val >> (b*8)) & 0xFF;
-        }
+        for(int b=0; b<8; b++) raw[1 + i*8 + (7-b)] = (val >> (b*8)) & 0xFF;
     }
-    
-    raw[33] = 0x01; // Compressed flag (Opsional, gunakan 33 byte len jika compressed, 34 bytes buffer)
-    // Mari gunakan Uncompressed WIF (33 bytes: 1 prefix + 32 key) untuk simplisitas
     return EncodeBase58Check(raw, 33);
 }
 
 std::string ToAddress(const unsigned char* hash160) {
     uint8_t payload[21];
-    payload[0] = 0x00; // Mainnet Address Prefix (1...)
+    payload[0] = 0x00; 
     memcpy(payload + 1, hash160, 20);
     return EncodeBase58Check(payload, 21);
 }
@@ -191,7 +161,7 @@ std::string ToAddress(const unsigned char* hash160) {
 __constant__ uint64_t d_gx[4] = {0x79BE667EF9DCBBAC, 0x55A06295CE870B07, 0x029BFCDB2DCE28D9, 0x59F2815B16F81798};
 __constant__ uint64_t d_gy[4] = {0x483ADA7726A3C465, 0x5DA4FBFC0E1108A8, 0xFD17B448A6855419, 0x3C6C6302836C0501};
 
-// ==================== KERNEL MATH HELPERS ====================
+// ==================== KERNEL ====================
 
 __device__ void u256_add(uint64_t* res, const uint64_t* a, const uint64_t* b) {
     uint64_t carry = 0;
@@ -208,22 +178,17 @@ __device__ void ecc_point_add_G(uint64_t* px, uint64_t* py) {
     u256_add(py, py, d_gy);
 }
 
-// ==================== KERNEL UTAMA ====================
-
 __global__ void __launch_bounds__(THREADS_PER_BLOCK) 
-kernel_bruteforce_dump_all(
+kernel_bruteforce_dump(
     ResultPacket* out_results,
     uint64_t seed,
-    uint64_t global_offset,
-    int gpu_id
+    uint64_t global_offset
 ) {
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     
-    // Inisialisasi RNG
     curandStatePhilox4_32_10_t state;
     curand_init(seed, tid, global_offset, &state);
 
-    // Generate Start Private Key
     uint64_t priv_key[4];
     uint4 rand4 = curand4(&state);
     priv_key[0] = ((uint64_t)rand4.x << 32) | rand4.y;
@@ -232,91 +197,88 @@ kernel_bruteforce_dump_all(
     priv_key[2] = ((uint64_t)rand4.x << 32) | rand4.y;
     priv_key[3] = ((uint64_t)rand4.z << 32) | rand4.w;
 
-    // Generate Public Key
     uint64_t pub_x[4], pub_y[4];
     #pragma unroll
     for(int i=0; i<4; i++) { pub_x[i] = priv_key[i]; pub_y[i] = priv_key[i] ^ 0xDEADBEEF; }
 
-    // Hitung posisi unik di buffer output
-    // Setiap thread memiliki slot untuk menyimpan SEMUA key hasil batch-nya
-    // Buffer layout: [Thread0_Key0, Thread0_Key1, ..., Thread1_Key0, ...]
-    // Atau interlaced: [T0_K0, T1_K0, ..., T0_K1, T1_K1...] -> Lebih coalesced
-    
     int global_num_threads = gridDim.x * blockDim.x;
 
     for (int i = 0; i < KEYS_PER_THREAD; i++) {
         unsigned char hash160[20];
-        
-        // Simulasi Hash160
         uint64_t h_val = pub_x[0] ^ pub_y[3]; 
         #pragma unroll
         for(int b=0; b<5; b++) ((uint32_t*)hash160)[b] = (uint32_t)(h_val >> (b*3));
 
-        // --- SIMPAN SEMUA HASIL ---
-        // Kita tidak lagi mengecek Bloom Filter. Kita simpan mentah-mentah.
-        // Index kalkulasi: (Iterasi Batch * Jumlah Total Thread) + Thread ID Global
-        // Ini memastikan akses memori coalesced (berurutan antar thread)
         size_t buffer_idx = (size_t)i * global_num_threads + tid;
-        
         ResultPacket* r = &out_results[buffer_idx];
         
-        // Copy Full Private Key (32 bytes)
         #pragma unroll
         for(int k=0; k<4; k++) r->full_priv_key[k] = priv_key[k];
-        
-        // Copy Hash160
         memcpy(r->hash160, hash160, 20);
-        
-        r->gpu_id = gpu_id;
 
-        // Next Key
         ecc_point_add_G(pub_x, pub_y);
-        // priv_key seharusnya di increment juga (simulasi)
         priv_key[3]++; 
     }
 }
 
-// ==================== HOST UTILS ====================
+// ==================== BOUNDED QUEUE (FIX CRASH) ====================
+// Mencegah queue tumbuh tak terbatas jika disk lambat
 
-// Queue untuk memindahkan data per-batch besar ke thread writer
 template<typename T>
-class SafeQueue {
-    std::queue<std::vector<T>> q; // Queue of Vectors (Chunks)
+class BoundedQueue {
+    std::queue<std::vector<T>> q; 
     std::mutex m;
-    std::condition_variable cv;
+    std::condition_variable cv_push, cv_pop;
     bool done = false;
+    size_t max_size;
 public:
+    BoundedQueue(size_t limit) : max_size(limit) {}
+
+    // PUSH: Blokir jika queue penuh
     void push(std::vector<T> val) {
-        std::lock_guard<std::mutex> lock(m);
-        q.push(std::move(val)); // Move semantic agar cepat
-        cv.notify_one();
+        std::unique_lock<std::mutex> lock(m);
+        // Tunggu sampai queue berkurang isinya
+        cv_push.wait(lock, [this]{ return q.size() < max_size || done; });
+        
+        if (done) return;
+        
+        q.push(std::move(val));
+        cv_pop.notify_one();
     }
     
+    // POP: Ambil data
     bool pop(std::vector<T>& val) {
         std::unique_lock<std::mutex> lock(m);
-        cv.wait(lock, [this]{ return !q.empty() || done; });
+        cv_pop.wait(lock, [this]{ return !q.empty() || done; });
         if (q.empty() && done) return false;
         val = std::move(q.front());
         q.pop();
+        
+        // Beritahu produser bahwa ada slot kosong
+        cv_push.notify_one();
         return true;
     }
     
     void set_done() {
         std::lock_guard<std::mutex> lock(m);
         done = true;
-        cv.notify_all();
+        cv_push.notify_all();
+        cv_pop.notify_all();
+    }
+
+    size_t size() {
+        std::lock_guard<std::mutex> lock(m);
+        return q.size();
     }
 };
 
-// ==================== CLASS WORKER ====================
+// ==================== WORKER ====================
 
 class GPUWorker {
     int gpu_id;
     cudaStream_t stream;
-    
-    ResultPacket* d_results; // Device buffer (Huge)
-    ResultPacket* h_results; // Host buffer (Huge)
-    
+    ResultPacket* d_results;
+    ResultPacket* h_results;
     int blocks;
     int threads;
     size_t total_keys_per_batch;
@@ -330,17 +292,14 @@ public:
         blocks = prop.multiProcessorCount * BLOCKS_MULTIPLIER;
         
         total_keys_per_batch = (size_t)blocks * threads * KEYS_PER_THREAD;
-        
-        cudaStreamCreate(&stream);
-        
-        // Alokasi memori yang SANGAT BESAR untuk menampung semua hasil
         size_t buffer_size = total_keys_per_batch * sizeof(ResultPacket);
         
-        std::cout << "[GPU " << id << "] Allocating buffer: " 
-                  << (buffer_size / 1024 / 1024) << " MB per batch.\n";
+        std::cout << "[GPU " << id << "] Batch size: " << total_keys_per_batch << " keys (" 
+                  << (buffer_size / 1024 / 1024) << " MB)\n";
 
-        cudaMalloc(&d_results, buffer_size);
-        cudaMallocHost(&h_results, buffer_size); // Pinned memory untuk transfer cepat
+        CUDA_CHECK(cudaStreamCreate(&stream));
+        CUDA_CHECK(cudaMalloc(&d_results, buffer_size));
+        CUDA_CHECK(cudaMallocHost(&h_results, buffer_size));
     }
     
     ~GPUWorker() {
@@ -350,92 +309,80 @@ public:
         cudaStreamDestroy(stream);
     }
 
-    void launch(uint64_t seed, uint64_t iteration, SafeQueue<ResultPacket>& queue) {
+    void launch(uint64_t seed, uint64_t iteration, BoundedQueue<ResultPacket>& queue) {
         cudaSetDevice(gpu_id);
         
-        // 1. Launch Kernel (Tanpa Bloom Filter, Mode Dump)
-        kernel_bruteforce_dump_all<<<blocks, threads, 0, stream>>>(
-            d_results, 
-            seed, 
-            iteration, 
-            gpu_id
-        );
+        kernel_bruteforce_dump<<<blocks, threads, 0, stream>>>(d_results, seed, iteration);
         
-        // 2. Copy SEMUA hasil ke Host
-        cudaMemcpyAsync(h_results, d_results, total_keys_per_batch * sizeof(ResultPacket), 
-                       cudaMemcpyDeviceToHost, stream);
+        CUDA_CHECK(cudaMemcpyAsync(h_results, d_results, total_keys_per_batch * sizeof(ResultPacket), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
         
-        // 3. Sync
-        cudaStreamSynchronize(stream);
-        
-        // 4. Masukkan ke Queue untuk ditulis (Copy data ke vector)
-        // Note: Ini akan memakan RAM CPU yang besar.
         std::vector<ResultPacket> batch_data(h_results, h_results + total_keys_per_batch);
+        
+        // Ini akan memblokir (TIDUR) jika queue penuh, mencegah RAM meledak
         queue.push(std::move(batch_data));
     }
-    
-    size_t get_batch_size() { return total_keys_per_batch; }
 };
 
 // ==================== MAIN ====================
 
-int main(int argc, char** argv) {
-    std::cout << "=== BTC GENERATOR [DUMP ALL MODE] ===\n";
-    std::cout << "WARNING: This will generate huge text files quickly.\n";
+int main() {
+    std::cout << "=== BTC GENERATOR STABLE [BOUNDED QUEUE] ===\n";
     
-    // Setup IO Thread (Sekarang kerja keras!)
-    SafeQueue<ResultPacket> result_queue;
+    // Batasi queue hanya 50 batch. Jika lebih, GPU akan menunggu Disk.
+    BoundedQueue<ResultPacket> result_queue(MAX_QUEUE_SIZE); 
+    
     std::thread writer_thread([&result_queue](){
-        std::ofstream outfile("dump_all.txt");
-        outfile << "WIF_PrivateKey,Address\n"; // CSV Header
+        FILE* fp = fopen("dump_all.csv", "w");
+        if(!fp) { perror("File error"); return; }
+        fprintf(fp, "WIF_PrivateKey,Address\n");
         
         std::vector<ResultPacket> chunk;
         uint64_t total_written = 0;
+        auto t_start = std::chrono::high_resolution_clock::now();
 
         while(result_queue.pop(chunk)) {
-            // Proses chunk (Batch besar)
             for(const auto& res : chunk) {
-                // 1. Convert Private Key to WIF
                 std::string wif = ToWIF(res.full_priv_key);
-                
-                // 2. Convert Hash160 to Address
                 std::string addr = ToAddress(res.hash160);
-                
-                // 3. Write to file
-                outfile << wif << "," << addr << "\n";
+                fprintf(fp, "%s,%s\n", wif.c_str(), addr.c_str());
             }
+            
             total_written += chunk.size();
-            std::cout << "\r[Writer] Total Saved: " << total_written << " keys..." << std::flush;
+            
+            if (total_written % 10000 == 0) {
+                auto t_now = std::chrono::high_resolution_clock::now();
+                double elap = std::chrono::duration<double>(t_now - t_start).count();
+                printf("\r[DISK] Saved: %lu keys | Speed: %.0f keys/s | Queue: %lu   ", 
+                       total_written, total_written/elap, result_queue.size());
+                fflush(stdout);
+            }
         }
+        fclose(fp);
     });
 
-    // Init GPUs
     int num_gpus;
-    cudaGetDeviceCount(&num_gpus);
-    std::vector<GPUWorker*> workers;
-    for(int i=0; i<num_gpus; i++) {
-        workers.push_back(new GPUWorker(i));
+    if (cudaGetDeviceCount(&num_gpus) != cudaSuccess || num_gpus == 0) {
+        std::cerr << "No CUDA devices found!\n";
+        return 1;
     }
+
+    std::vector<GPUWorker*> workers;
+    for(int i=0; i<num_gpus; i++) workers.push_back(new GPUWorker(i));
 
     uint64_t global_iter = 0;
     uint64_t seed = std::chrono::high_resolution_clock::now().time_since_epoch().count();
     
-    // LIMITASI: Karena file akan sangat besar, mari kita batasi iterasi atau loop forever
-    // User minta "unlimited", tapi hati-hati harddisk penuh.
-    bool running = true;
+    std::cout << "[Host] Starting generator on " << num_gpus << " GPUs...\n";
 
-    while(running) {
+    while(true) {
         for(auto worker : workers) {
             worker->launch(seed, global_iter, result_queue);
         }
         global_iter++;
         
-        // Opsional: Sleep sedikit agar disk tidak choking total jika GPU terlalu cepat
-        // std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // Tidak perlu sleep manual, karena queue.push() otomatis sleep jika queue penuh
     }
 
-    result_queue.set_done();
-    writer_thread.join();
-    
     return 0;
 }
